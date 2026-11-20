@@ -32,22 +32,51 @@ class TwitchDiscoveryTests(unittest.TestCase):
 
 
 class StreamReportTests(unittest.TestCase):
-    def test_optional_failure_and_empty_search_are_reported_separately(self):
-        row = {"channel": "example", "title": "Live", "viewers": 0, "live_for": "", "url": "https://twitch.tv/example"}
-        with tempfile.TemporaryDirectory() as directory:
+    def run_report(self, platform, **providers):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
             report = Path(directory) / "streams.md"
-            with (
-                patch.object(sys, "argv", ["streams.py", "--out", str(report)]),
-                patch.object(streams, "twitch", return_value=[row]),
-                patch.object(streams, "youtube", return_value=[]),
-                patch.object(streams, "kick", side_effect=RuntimeError("HTTP 403")),
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()) as errors,
-            ):
-                streams.main()
-            text = report.read_text()
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            errors = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            for name in ("twitch", "youtube", "kick"):
+                outcome = providers.get(name, [])
+                settings = {"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome}
+                stack.enter_context(patch.object(streams, name, **settings))
+            status = streams.main(["--platform", platform, "--out", str(report)])
+            return status, report.read_text(), errors.getvalue()
 
-        self.assertIn("| example | Live | 0 |", text)
-        self.assertIn("## YouTube\n\nNo live streams found.", text)
-        self.assertIn("## Kick\n\nOptional provider unavailable: HTTP 403", text)
-        self.assertIn("Kick: Optional provider unavailable", errors.getvalue())
+    def test_explicit_provider_failure_returns_nonzero_and_writes_report(self):
+        for provider in ("twitch", "youtube", "kick"):
+            with self.subTest(provider=provider):
+                status, report, errors = self.run_report(
+                    provider, **{provider: RuntimeError("HTTP 403")}
+                )
+                self.assertEqual(status, 1)
+                self.assertIn("Required provider failed: HTTP 403", report)
+                self.assertIn("Required provider failed: HTTP 403", errors)
+                self.assertEqual(report.count("## "), 1)
+
+    def test_empty_success_returns_zero(self):
+        status, report, errors = self.run_report("twitch")
+        self.assertEqual(status, 0)
+        self.assertIn("## Twitch\n\nNo live streams found.", report)
+        self.assertEqual(errors, "")
+
+    def test_optional_failure_does_not_change_exit_code(self):
+        status, report, errors = self.run_report("all", kick=RuntimeError("HTTP 404"))
+        self.assertEqual(status, 0)
+        self.assertIn("## YouTube\n\nNo live streams found.", report)
+        self.assertIn("## Kick\n\nOptional provider unavailable: HTTP 404", report)
+        self.assertIn("Kick: Optional provider unavailable", errors)
+
+    def test_all_platforms_preserves_results_and_labels_both_failure_types(self):
+        row = {"channel": "example", "title": "Live", "viewers": 0, "live_for": "",
+               "url": "https://twitch.tv/example"}
+        status, report, errors = self.run_report(
+            "all", twitch=[row], youtube=SystemExit("yt-dlp missing"), kick=RuntimeError("HTTP 404")
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("| example | Live | 0 |", report)
+        self.assertIn("## YouTube\n\nRequired provider failed: yt-dlp missing", report)
+        self.assertIn("## Kick\n\nOptional provider unavailable: HTTP 404", report)
+        self.assertIn("YouTube: Required provider failed", errors)
+        self.assertIn("Kick: Optional provider unavailable", errors)

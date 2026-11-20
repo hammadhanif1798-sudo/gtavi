@@ -82,7 +82,7 @@ def twitch(query, limit=20):
     response.raise_for_status()
     s = response.json()
     now = time.time(); out = []
-    for x in s.get("data", []):
+    for x in s["data"]:
         try:
             st = time.mktime(time.strptime(x["started_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
         except Exception:
@@ -108,12 +108,12 @@ def kick(query):
              "live_for": ""} for c in items if isinstance(c, dict) and c.get("livestream")]
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default="gta 6"); ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--out", default="streams.md")
     ap.add_argument("--platform", choices=("all", "twitch", "youtube", "kick"), default="all")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if not 1 <= a.limit <= 100:
         ap.error("--limit must be between 1 and 100")
     providers = {
@@ -123,15 +123,18 @@ def main():
     }
     stamp = time.strftime("%Y-%m-%d %H:%M")
     md = [f"# Live streams: {a.query}", f"Checked {stamp}. Viewer counts are as returned at that moment.", ""]
+    required_failed = False
     for name, search in providers.items():
         if a.platform not in ("all", name.lower()):
             continue
         md += [f"## {name}", ""]
         try:
             rows = search()
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:  # Tool lookup can call sys.exit().
             detail = " ".join(str(exc).split())
-            label = "Optional provider unavailable" if name == "Kick" else "Search unavailable"
+            optional = name == "Kick" and a.platform == "all"
+            label = "Optional provider unavailable" if optional else "Required provider failed"
+            required_failed |= not optional
             print(f"{name}: {label}: {detail}", file=sys.stderr)
             md += [f"{label}: {detail}", ""]
             continue
@@ -148,7 +151,8 @@ def main():
         md.append("")
     Path(a.out).write_text("\n".join(md), encoding="utf-8")
     print(f"wrote {a.out}")
+    return 1 if required_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

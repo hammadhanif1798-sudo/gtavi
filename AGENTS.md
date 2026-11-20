@@ -23,8 +23,11 @@ python3 -m venv .venv
 
 For Twitch-only discovery, use
 `.venv/bin/python scripts/streams.py --platform twitch --query "gta 6" --limit 10`.
-The default report checks all providers and distinguishes a failed search from a
-successful search with no results. Kick is optional. Twitch can run independently
+The default report checks all providers and preserves successful results when
+another provider fails. The command exits 1 after writing the report if Twitch or
+YouTube fails in all-platform mode. Kick failures are optional in that mode.
+With an explicit provider, a retrieval failure exits 1. A successful search with
+no results exits 0. Twitch can run independently
 when the Cloud proxy denies YouTube CONNECT requests. Use the inherited proxy and
 certificate settings. For a direct yt-dlp invocation in Cloud, use
 `.venv/bin/python -m yt_dlp --compat-options no-certifi` to select the system
