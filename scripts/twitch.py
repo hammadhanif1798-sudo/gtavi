@@ -22,12 +22,15 @@ def gql(query, variables=None):
     r = requests.post(GQL, json={"query": query, "variables": variables or {}},
                       headers={"Client-Id": CLIENT_ID}, timeout=15)
     r.raise_for_status()
-    return r.json()
+    payload = r.json()
+    if payload.get("errors"):
+        raise RuntimeError("; ".join(error["message"] for error in payload["errors"]))
+    return payload
 
 
 _Q_GAME = """query($name:String!,$n:Int!){ game(name:$name){ displayName streams(first:$n){ edges{ node{
  title viewersCount createdAt previewImageURL(width:640,height:360) broadcaster{ login displayName } } } } } }"""
-_Q_SEARCH = """query($q:String!){ searchCategories(userQuery:$q,first:5){ edges{ node{ ... on Game{ name displayName } } } } }"""
+_Q_SEARCH = """query($q:String!){ searchCategories(query:$q,first:5){ edges{ node{ ... on Game{ name displayName } } } } }"""
 
 
 def _rows(game):
@@ -45,27 +48,27 @@ def _rows(game):
 
 def top_streams(game="Grand Theft Auto VI", limit=20):
     """Live streams of a Twitch category, sorted by viewers (desc). Empty list if the category is unknown/offline."""
-    names = [game]
+    gta_vi = game.casefold().strip() in {"gta 6", "gta vi", "grand theft auto 6", "grand theft auto vi"}
+    names = ["Grand Theft Auto VI", "GTA VI"] if gta_vi else [game]
     try:
         d = gql(_Q_SEARCH, {"q": game})
         for e in ((d.get("data") or {}).get("searchCategories") or {}).get("edges") or []:
             nm = (e.get("node") or {}).get("name")
-            if nm and nm not in names:
+            if nm and not gta_vi and nm not in names:
                 names.append(nm)
     except Exception as ex:
         print(f"twitch category search failed: {ex}", file=sys.stderr)
-    if game.lower() != "gta vi":
-        names.append("Grand Theft Auto VI" if "grand theft" not in game.lower() else "GTA VI")
+    failures = []
     for nm in names:
         try:
             g = ((gql(_Q_GAME, {"name": nm, "n": int(limit)}).get("data") or {}).get("game"))
         except Exception as ex:
-            print(f"twitch gql failed: {ex}", file=sys.stderr)
+            failures.append(ex)
             continue
         if g:
-            rows = _rows(g)
-            if rows:
-                return sorted(rows, key=lambda r: r["viewers"], reverse=True)
+            return sorted(_rows(g), key=lambda r: r["viewers"], reverse=True)
+    if failures:
+        raise RuntimeError(f"Twitch category lookup failed: {failures[0]}") from failures[0]
     return []
 
 

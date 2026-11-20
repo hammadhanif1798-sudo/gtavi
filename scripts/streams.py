@@ -1,7 +1,7 @@
 """Find live streams about a topic, ranked by concurrent viewers.
 
 usage: python streams.py --query "gta 6" --limit 20 --out streams.md
-YouTube always. Twitch always (Helix if TWITCH_CLIENT_ID and TWITCH_TOKEN are set, else keyless public GQL). Kick is tried once, skipped silently on failure.
+Twitch uses Helix when credentials are set, otherwise public GraphQL. Kick is optional.
 Viewer counts are exactly what the platform returned at run time.
 """
 import argparse, json, os, sys, time
@@ -29,8 +29,7 @@ def youtube(query, limit):
     url = f"https://www.youtube.com/results?search_query={quote_plus(query)}&sp=EgJAAQ%253D%253D"
     r = run(ytdlp_base() + ["--flat-playlist", "-J", "--playlist-end", str(limit), url], capture=True, check=False)
     if r.returncode != 0 or not r.stdout.strip():
-        print(f"youtube search failed: {(r.stderr or '')[-300:]}", file=sys.stderr)
-        return []
+        raise RuntimeError((r.stderr or "No search response")[-300:].strip())
     ids = []
     for e in json.loads(r.stdout).get("entries") or []:
         if e and e.get("id"):
@@ -39,11 +38,13 @@ def youtube(query, limit):
     def one(u):
         try:
             return ytdlp_json(u)
-        except BaseException:  # run() calls sys.exit on failure
+        except (SystemExit, ValueError):  # run() calls sys.exit on failure
             return None
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         infos = list(ex.map(one, ids))
+    if ids and not any(infos):
+        raise RuntimeError("Could not read metadata for any search result")
     now = time.time(); out = []
     for i in infos:
         if not i or not i.get("is_live"):
@@ -58,33 +59,30 @@ def youtube(query, limit):
 def twitch_nokey(game="Grand Theft Auto VI", limit=20):
     """No account/API key: Twitch public web GQL (see twitch.py)."""
     import twitch as tw
-    try:
-        rows = tw.top_streams(game, limit)
-    except Exception as e:
-        print(f"twitch (no key) failed: {e}", file=sys.stderr)
-        return []
+    rows = tw.top_streams(game, limit)
     now = time.time()
     return [{"platform": "Twitch", "channel": r["login"], "title": r["title"], "url": r["url"], "viewers": r["viewers"],
              "live_for": fmt_dur(now - tw.started_ts(r["created_at"])) if tw.started_ts(r["created_at"]) else ""} for r in rows]
 
 
-def twitch(query):
+def twitch(query, limit=20):
     cid, tok = os.environ.get("TWITCH_CLIENT_ID"), os.environ.get("TWITCH_TOKEN")
+    game = "Grand Theft Auto VI" if query.casefold().strip() in {"gta 6", "gta vi", "grand theft auto 6", "grand theft auto vi"} else query
     if not (cid and tok):
-        return twitch_nokey()
+        return twitch_nokey(game, limit)
     import requests
     h = {"Client-Id": cid, "Authorization": f"Bearer {tok}"}
-    try:
-        g = requests.get("https://api.twitch.tv/helix/games", params={"name": "Grand Theft Auto VI"}, headers=h, timeout=15).json()
-        if not g.get("data"):
-            return []
-        gid = g["data"][0]["id"]
-        s = requests.get("https://api.twitch.tv/helix/streams", params={"game_id": gid, "first": 100}, headers=h, timeout=15).json()
-    except Exception as e:
-        print(f"twitch failed: {e}", file=sys.stderr)
+    games = requests.get("https://api.twitch.tv/helix/games", params={"name": game}, headers=h, timeout=15)
+    games.raise_for_status()
+    categories = games.json()["data"]
+    if not categories:
         return []
+    response = requests.get("https://api.twitch.tv/helix/streams",
+                            params={"game_id": categories[0]["id"], "first": limit}, headers=h, timeout=15)
+    response.raise_for_status()
+    s = response.json()
     now = time.time(); out = []
-    for x in s.get("data", []):
+    for x in s["data"]:
         try:
             st = time.mktime(time.strptime(x["started_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
         except Exception:
@@ -96,41 +94,52 @@ def twitch(query):
 
 
 def kick(query):
-    """Public API is often blocked; one try, silent on any failure."""
-    try:
-        import requests
-        r = requests.get("https://kick.com/api/v2/channels", params={"query": query}, timeout=8,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        items = data if isinstance(data, list) else data.get("data", [])
-        return [{"platform": "Kick", "channel": c.get("slug", ""), "title": (c.get("livestream") or {}).get("session_title", ""),
-                 "url": f"https://kick.com/{c.get('slug', '')}", "viewers": (c.get("livestream") or {}).get("viewer_count"),
-                 "live_for": ""} for c in items if isinstance(c, dict) and c.get("livestream")]
-    except Exception:
-        return []
+    """Query the optional public Kick endpoint once."""
+    import requests
+    response = requests.get("https://kick.com/api/v2/channels", params={"query": query}, timeout=8,
+                            headers={"User-Agent": "Mozilla/5.0"})
+    response.raise_for_status()
+    data = response.json()
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("Unexpected Kick search response")
+    return [{"platform": "Kick", "channel": c.get("slug", ""), "title": c["livestream"].get("session_title", ""),
+             "url": f"https://kick.com/{c.get('slug', '')}", "viewers": c["livestream"].get("viewer_count"),
+             "live_for": ""} for c in items if isinstance(c, dict) and c.get("livestream")]
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default="gta 6"); ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--out", default="streams.md")
-    a = ap.parse_args()
-    sections = [("YouTube", youtube(a.query, a.limit))]
-    t = twitch(a.query)
-    if t:
-        t = sorted(t, key=lambda r: r["viewers"] or -1, reverse=True)[:a.limit]
-    if t is not None:
-        sections.append(("Twitch", t))
-    k = kick(a.query)
-    if k:
-        sections.append(("Kick", k))
+    ap.add_argument("--platform", choices=("all", "twitch", "youtube", "kick"), default="all")
+    a = ap.parse_args(argv)
+    if not 1 <= a.limit <= 100:
+        ap.error("--limit must be between 1 and 100")
+    providers = {
+        "Twitch": lambda: twitch(a.query, a.limit),
+        "YouTube": lambda: youtube(a.query, a.limit),
+        "Kick": lambda: kick(a.query),
+    }
     stamp = time.strftime("%Y-%m-%d %H:%M")
     md = [f"# Live streams: {a.query}", f"Checked {stamp}. Viewer counts are as returned at that moment.", ""]
-    for name, rows in sections:
-        rows = sorted(rows, key=lambda r: r["viewers"] or -1, reverse=True)
+    required_failed = False
+    for name, search in providers.items():
+        if a.platform not in ("all", name.lower()):
+            continue
         md += [f"## {name}", ""]
+        try:
+            rows = search()
+        except (Exception, SystemExit) as exc:  # Tool lookup can call sys.exit().
+            detail = " ".join(str(exc).split())
+            optional = name == "Kick" and a.platform == "all"
+            label = "Optional provider unavailable" if optional else "Required provider failed"
+            required_failed |= not optional
+            print(f"{name}: {label}: {detail}", file=sys.stderr)
+            md += [f"{label}: {detail}", ""]
+            continue
+        rows = sorted(rows, key=lambda r: r["viewers"] if r["viewers"] is not None else -1,
+                      reverse=True)[:a.limit]
         if not rows:
             md += ["No live streams found.", ""]
             continue
@@ -142,7 +151,8 @@ def main():
         md.append("")
     Path(a.out).write_text("\n".join(md), encoding="utf-8")
     print(f"wrote {a.out}")
+    return 1 if required_failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
