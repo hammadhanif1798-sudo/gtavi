@@ -26,8 +26,9 @@ def ytdlp_base():
     import importlib.util
     exe = [sys.executable, "-m", "yt_dlp"] if importlib.util.find_spec("yt_dlp") else [tool("yt-dlp")]
     base = exe + ["--no-warnings", "--no-progress"]
-    if sys.platform == "win32":
-        base += ["--compat-options", "no-certifi"]  # use the Windows certificate store
+    if sys.platform == "win32" or os.environ.get("SSL_CERT_FILE"):
+        # Use system or environment-provided trust with verification still enabled.
+        base += ["--compat-options", "no-certifi"]
     return base
 
 
